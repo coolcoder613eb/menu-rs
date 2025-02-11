@@ -8,7 +8,7 @@ use crossterm::{
 use shlex;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug)]
@@ -25,6 +25,26 @@ struct Menu {
 }
 
 const MENU_FILE: &str = "menu.csv";
+
+fn expand_tilde<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+    let path_str = path.as_ref().to_string_lossy();
+    if path_str.starts_with('~') {
+        if let Some(home) = dirs::home_dir() {
+            if path_str == "~" {
+                Ok(home)
+            } else {
+                Ok(home.join(&path_str[2..]))
+            }
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not determine home directory",
+            ))
+        }
+    } else {
+        Ok(path.as_ref().to_path_buf())
+    }
+}
 
 impl MenuItem {
     fn from_csv_line(line: &str) -> Option<Self> {
@@ -51,6 +71,10 @@ impl MenuItem {
     fn is_submenu(&self) -> bool {
         self.command.is_empty()
     }
+
+    fn get_expanded_working_dir(&self) -> io::Result<PathBuf> {
+        expand_tilde(&self.working_dir)
+    }
 }
 
 impl Menu {
@@ -63,10 +87,11 @@ impl Menu {
     }
 
     fn load_from_file<P: AsRef<Path>>(path: P) -> io::Result<Menu> {
-        let file = File::open(&path).map_err(|e| {
+        let expanded_path = expand_tilde(path.as_ref())?;
+        let file = File::open(&expanded_path).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("Failed to open {}: {}", path.as_ref().display(), e),
+                format!("Failed to open {}: {}", expanded_path.display(), e),
             )
         })?;
         let reader = BufReader::new(file);
@@ -129,7 +154,8 @@ impl Menu {
     fn run_selected(&self) -> io::Result<()> {
         if let Some(item) = self.items.get(self.selected) {
             if item.is_submenu() {
-                let submenu_path = Path::new(&item.working_dir).join(MENU_FILE);
+                let expanded_dir = item.get_expanded_working_dir()?;
+                let submenu_path = expanded_dir.join(MENU_FILE);
                 if let Ok(mut submenu) = Menu::load_from_file(&submenu_path) {
                     submenu.run()?;
                 } else {
@@ -138,17 +164,36 @@ impl Menu {
                 return Ok(());
             }
 
-            execute!(io::stdout(), Clear(ClearType::All), EnableLineWrap)?;
+            // Properly restore terminal state before running command
+            execute!(
+                io::stdout(),
+                Show,
+                EnableLineWrap,
+                Clear(ClearType::All),
+                MoveTo(0, 0)
+            )?;
+            crossterm::terminal::disable_raw_mode()?;
 
             if let Some(program) = item.command.first() {
                 let args = item.command.iter().skip(1);
+                let expanded_dir = item.get_expanded_working_dir()?;
                 let status = Command::new(program)
                     .args(args)
-                    .current_dir(&item.working_dir)
+                    .current_dir(&expanded_dir)
                     .status()
                     .map_err(|e| {
                         io::Error::new(e.kind(), format!("Failed to execute '{}': {}", program, e))
                     })?;
+
+                // After command completes, wait for any key before restoring menu state
+                println!("\nPress any key to continue...");
+                crossterm::terminal::enable_raw_mode()?;
+                read()?;
+                crossterm::terminal::disable_raw_mode()?;
+
+                // Restore terminal state for menu
+                crossterm::terminal::enable_raw_mode()?;
+                execute!(io::stdout(), Hide, DisableLineWrap)?;
 
                 if !status.success() {
                     self.show_error(&format!(
@@ -157,20 +202,29 @@ impl Menu {
                     ))?;
                 }
             }
-            execute!(io::stdout(), Hide, DisableLineWrap)?;
         }
         Ok(())
     }
 
     fn show_error(&self, message: &str) -> io::Result<()> {
+        // Temporarily restore normal terminal state
         execute!(
             io::stdout(),
             Clear(ClearType::All),
             EnableLineWrap,
-            Print(format!("Error: {}\nPress any key to continue...", message))
+            Show,
+            MoveTo(0, 0)
         )?;
+        crossterm::terminal::disable_raw_mode()?;
+
+        println!("Error: {}\nPress any key to continue...", message);
+        crossterm::terminal::enable_raw_mode()?;
         read()?;
-        execute!(io::stdout(), DisableLineWrap)?;
+        crossterm::terminal::disable_raw_mode()?;
+
+        // Restore menu terminal state
+        crossterm::terminal::enable_raw_mode()?;
+        execute!(io::stdout(), Hide, DisableLineWrap)?;
         Ok(())
     }
 
